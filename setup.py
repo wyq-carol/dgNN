@@ -26,6 +26,7 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     python_requires=">=3.6",
     ext_modules=[
+        CUDAExtension('fused_tmpAttn', ['dgNN/src/fused_tmpAttn/fused_tmpAttn.cpp', 'dgNN/src/fused_tmpAttn/fused_tmpAttn_kernel.cu'], extra_compile_args={'cxx':[], 'nvcc':['-arch=sm_70']}, extra_link_args=['-lcurand']),
         CUDAExtension('fused_gatconv', ['dgNN/src/fused_gatconv/fused_gatconv.cpp', 'dgNN/src/fused_gatconv/fused_gatconv_kernel.cu'], extra_compile_args={'cxx':[], 'nvcc':['-arch=sm_70']}, extra_link_args=['-lcurand']),
         CUDAExtension('fused_edgeconv',['dgNN/src/fused_edgeconv/fused_edgeconv.cpp','dgNN/src/fused_edgeconv/fused_edgeconv_kernel.cu'], extra_compile_args={'cxx':[], 'nvcc':['-arch=sm_70']}, extra_link_args=['-lcurand']),
         CUDAExtension('fused_gmmconv',['dgNN/src/fused_gmmconv/fused_gmmconv.cpp','dgNN/src/fused_gmmconv/fused_gmmconv_kernel.cu'], extra_compile_args={'cxx':[], 'nvcc':['-arch=sm_70']}, extra_link_args=['-lcurand']),

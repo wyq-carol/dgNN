@@ -6,6 +6,7 @@ setup(
     name='dgNN',
     version='0.0.1',
     ext_modules=[
+        CUDAExtension('fused_tmpAttn', ['fused_tmpAttn/fused_tmpAttn.cpp', 'fused_tmpAttn/fused_tmpAttn_kernel.cu']),
         CUDAExtension('fused_gat', ['fused_gat/fused_gat.cpp', 'fused_gat/fused_gat_kernel.cu']),
         CUDAExtension('fused_edgeconv',['fused_edgeconv/fused_edgeconv.cpp','fused_edgeconv/fused_edgeconv_kernel.cu']),
         CUDAExtension('fused_gmm',['fused_gmm/fused_gmm.cpp','fused_gmm/fused_gmm_kernel.cu']),
