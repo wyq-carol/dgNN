@@ -21,7 +21,7 @@ from tglite._context import TContext
 from tglite._sampler import TSampler
 from tglite.op import precomputed_zeros, precomputed_times
 from tglite import _c
-from dgNN.layers import TemporalAttnLayer0_2_perfCeil as OptimizedLayer
+from dgNN.layers import TemporalAttnLaye_OptimizedLayer as OptimizedLayer
 from torch import Tensor
 from tglite._block import TBlock
 
@@ -243,7 +243,11 @@ class PerformanceMetrics:
         )
 
 def generate_test_data(
-    index: torch.Tensor,
+    _g_dstindex: torch.Tensor,
+    dstdata_h: torch.Tensor,
+    srcdata_h: torch.Tensor,
+    efeat: torch.Tensor,
+    time_deltas: torch.Tensor,
     num_nodes: int,
     num_dsts: int,
     num_edges: int, # num_srcs
@@ -255,7 +259,7 @@ def generate_test_data(
     """生成测试数据"""
     # 创建测试数据
     blk = MockBlock(
-        index=index,
+        index=_g_dstindex,
         num_src=num_edges,  # 源节点数
         num_dst=num_dsts,  # 目标节点数
         num_edges=num_edges,  # 边数
@@ -264,16 +268,22 @@ def generate_test_data(
     
     # 创建Context
     ctx = MockTContext(device=device)
-    
+
+    with torch.no_grad():
+        print("here")
+        nodeData, _reverse_nids = torch.unique(torch.cat((srcdata_h, dstdata_h), dim=0), dim=0, return_inverse=True)
+        efeat_unique, _reverse_eids = torch.unique(efeat, dim=0, return_inverse=True)
+        _unique_time_delta, _reverse_time_delta = torch.unique(time_deltas, dim=0, return_inverse=True)
+
     return {
         'blk': blk,
         'ctx': ctx,
-        'node_features': torch.randn(num_nodes, dim_node, device=device),
-        'edge_features': torch.randn(num_edges, dim_edge, device=device),
-        'time_features': torch.randn(num_edges, dim_time, device=device),
-        'node_inverse': torch.randint(0, num_nodes, (num_edges,), device=device),
-        'edge_inverse': torch.arange(num_edges, device=device),
-        'time_inverse': torch.arange(num_edges, device=device),
+        'nodeData': nodeData,
+        'reverse_nids': _reverse_nids,
+        'efeat_unique': efeat_unique,
+        'reverse_eids': _reverse_eids,
+        'unique_time_delta': _unique_time_delta,
+        'reverse_time_delta': _reverse_time_delta
     }
 
 def measure_memory_usage() -> float:
@@ -290,13 +300,15 @@ def measure_memory_usage() -> float:
 
 def get_layer_input(layer, test_data):
     """根据层类型返回对应的输入参数"""
-    if isinstance(layer, (OriginalLayer, OptimizedLayer)):
+    if isinstance(layer, (OriginalLayer, )):
         return (test_data['blk'],)  # 返回一个单元素元组
+    elif isinstance(layer, (OptimizedLayer, )):
+        return (test_data['blk'], test_data['nodeData'], test_data['reverse_nids'], test_data['efeat_unique'], test_data['reverse_eids'], test_data['unique_time_delta'], test_data['reverse_time_delta'])
     else:  # GATConv
         return (test_data['row_ptr'], test_data['col_idx'], test_data['col_ptr'], 
                 test_data['row_idx'], test_data['permute'], test_data['features'])
 
-def test_layer_performance(layer, test_data, num_epochs=10, device='cuda'):
+def test_layer_performance(layer, test_data, num_epochs=30, device='cuda'):
     """测试单个层的性能"""
     # 重置GPU内存统计
     torch.cuda.reset_peak_memory_stats()
@@ -376,7 +388,7 @@ def run_ablation_study(test_data, num_epochs=10, device='cuda'):
             num_heads=2,
             dropout=0.1
         ),
-        'optimized': OriginalLayer(
+        'optimized': OptimizedLayer(
             ctx=test_data['ctx'],
             dim_node=100,
             dim_edge=172,
@@ -455,7 +467,11 @@ def main():
     # 生成测试数据
     print("\n生成测试数据...")
     test_data = generate_test_data(
-        index=torch.load("blk._g_dstindex.pt"),
+        _g_dstindex=torch.load("blk._g_dstindex.pt"),
+        dstdata_h=torch.load("blk.dstdata_h.pt"),
+        srcdata_h=torch.load("blk.srcdata_h.pt"),
+        efeat=torch.load("blk.efeat.pt"),
+        time_deltas=torch.load("blk.time_deltas.pt"),
         num_nodes=90180,
         num_dsts=16350,
         num_edges=90180,
