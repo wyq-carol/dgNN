@@ -8,197 +8,478 @@ import dgl
 import torch.nn as nn
 import GPUtil
 import scipy.sparse as sp
-
-class Net(nn.Module):
-    def __init__(self,
-                 row_ptr,col_idx,col_ptr,row_idx,permute,
-                 num_layers,
-                 in_dim,
-                 num_hidden,
-                 num_classes,
-                 heads,
-                 activation=None,
-                 feat_drop=0.,
-                 attn_drop=0.,
-                 negative_slope=0.2,
-                 residual=None):
-        super(Net, self).__init__()
-        self.row_ptr=row_ptr
-        self.col_idx=col_idx
-        self.col_ptr=col_ptr
-        self.row_idx=row_idx
-        self.permute=permute
-        self.num_layers = num_layers
-        self.gat_layers = nn.ModuleList()
-        # input projection (no residual)
-        self.gat_layers.append(GATConv(
-            in_dim, num_hidden, heads[0],feat_drop,attn_drop,
-            negative_slope,residual,bias=False))
-        # hidden layers
-        for l in range(1, num_layers):
-            # due to multi-head, the in_dim = num_hidden * num_heads
-            self.gat_layers.append(GATConv(
-                num_hidden * heads[l-1], num_hidden, heads[l],feat_drop,attn_drop,
-                negative_slope,residual))
-        # output projection
-        self.gat_layers.append(GATConv(
-            num_hidden * heads[-2], num_classes, heads[-1],feat_drop,attn_drop,
-           negative_slope))
-
-    def forward(self,inputs):
-        h = inputs
-        for l in range(self.num_layers):
-            h = self.gat_layers[l](self.row_ptr,self.col_idx,self.col_ptr,self.row_idx,self.permute,h).flatten(1) # h.shape[-1] = num_heads*out_feats
-        # output projection
-        logits = self.gat_layers[-1](self.row_ptr,self.col_idx,self.col_ptr,self.row_idx,self.permute,h).mean(1)
-        return logits
-
-def accuracy(logits, labels):
-    _, indices = torch.max(logits, dim=1)
-    correct = torch.sum(indices == labels)
-    return correct.item() * 1.0 / len(labels)
+import tglite as tg
+from tglite.mymodule import *
+import torch
+import time
+import numpy as np
+from typing import Dict, List, Tuple
+import sys
+import os
+from tglite.nn import TemporalAttnLayer as OriginalLayer
+from tglite._context import TContext
+from tglite._sampler import TSampler
+from tglite.op import precomputed_zeros, precomputed_times
+from tglite import _c
 
 
-def load_dataset(args):
-    if args.dataset == 'cora':
-        data = dgl.data.CoraGraphDataset()
-    elif args.dataset == 'citeseer':
-        data = dgl.data.CiteseerGraphDataset()
-    elif args.dataset == 'pubmed':
-        data = dgl.data.PubmedGraphDataset()
-    elif args.dataset == 'reddit':
-        data = dgl.data.RedditDataset()
-    else:
-        raise ValueError('Unknown dataset: {}'.format(args.dataset))
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+# from examples.compute_z_ours.python.nn_optimized import TemporalAttnLayer as OptimizedLayer
+# from examples.compute_z_ours.python.nn_ablation1 import TemporalAttnLayer as Ablation1Layer
+# from examples.compute_z_ours.python.nn_ablation2 import TemporalAttnLayer as Ablation2Layer
 
-    g = data[0]
-    # add self loop
-    g = dgl.remove_self_loop(g)
-    g = dgl.add_self_loop(g)
+class MockGraph:
+    def __init__(self, device):
+        self._device = device
+        
+    def compute_device(self):
+        return self._device
+    def device(self):
+        return self._device
+    def storage_device(self):
+        return self._device
+
+class MockTContext:
+    def __init__(self, training=True, time_enabled=False, time_window=1000, device='cuda'):
+        self._training = training
+        self._time_enabled = time_enabled
+        self._time_window = time_window
+        self._g = MockGraph(device)
+        self._time_tables = {}
+        self._z = None
+
+class MockBlock:
+    """模拟TBlock的数据结构"""
+    def __init__(self, index, num_src: int, num_dst: int, num_edges: int, device: torch.device):
+        self._g = MockGraph(device)
+        self._g_dstindex = index
+        self._num_src = num_src
+        self._num_dst = num_dst
+        self._num_edges = num_edges
+        self._device = device
+        self._layer = 0
+        
+        # 初始化数据
+        # 根据tmp.log数据，srcdata和dstdata的h特征维度为100
+        self._srcdata = {'h': torch.randn(num_src, 100, device=device)}
+        self._dstdata = {'h': torch.randn(num_dst, 100, device=device)}
+        
+        # 根据tmp.log数据，efeat维度为172
+        self._efeat = torch.randn(num_edges, 172, device=device) if num_edges > 0 else None
+        
+        # 根据tmp.log数据，time_deltas是一维的
+        self._time_deltas = torch.randn(num_edges, device=device) if num_edges > 0 else None
+    def num_src(self) -> int:
+        return self._num_src
+    def num_dst(self) -> int:
+        return self._num_dst
+    def num_edges(self) -> int:
+        return self._num_edges
+    @property
+    def srcdata(self):
+        return self._srcdata
+    @property
+    def dstdata(self):
+        return self._dstdata
+    def efeat(self) -> torch.Tensor:
+        return self._efeat
+    def time_deltas(self) -> torch.Tensor:
+        return self._time_deltas
+        
+    @property
+    def layer(self) -> int:
+        return self._layer
+
+def test_precomputed_zeros():
+    # 测试场景1: 训练模式
+    ctx = MockTContext(training=True)
+    id = 0
+    num = 5
+    def encoder(is_zero: bool, ts: torch.Tensor) -> torch.Tensor:
+        if is_zero:
+            return torch.zeros(num, 10, device=ctx._g.compute_device())
+        else:
+            return torch.randn(num, 10, device=ctx._g.compute_device())
+            
+    # result1 = precomputed_zeros(ctx, 0, encoder, 5)
+    # def precomputed_zeros(ctx: TContext, id: int, encoder: Callable, num: int) -> Tensor:
+    cdev = ctx._g.compute_device()
+    if ctx._training or not ctx._time_enabled:
+        # return encoder(True, None)
+        return encoder(True, torch.zeros(num, dtype=torch.float, device=cdev))
+        
+        if ctx._z is not None:
+            return encoder.preload_zeros(ctx._z.expand(num))
+        else: 
+            # 写kernel 不要真的生成torch.zeros
+            if getattr(encoder, '__tg_builtin_encoder__', False):
+                return encoder.zeros(num, cdev)
+            else:
+                return encoder(False, torch.zeros(num, dtype=torch.float, device=cdev))
+
+    time_table = ctx._time_tables.get(id) # id 为layer id
+    if time_table is None:
+        time_table = encoder(False, torch.arange(
+            ctx._time_window + 1, dtype=torch.float, device=cdev))
+        ctx._time_tables[id] = time_table
+
+    output = time_table[0].repeat(num, 1)
+    result1 = output.view(num, -1)
+    print("训练模式结果形状:", result1.shape)
     
-    col,row=g.edges(order='srcdst')
-    edge_idx=torch.stack((col,row))
-    numlist = torch.arange(col.size(0), dtype=torch.int32)
+    # 测试场景2: 推理模式
+    ctx = MockTContext(training=False)
+    # result2 = precomputed_zeros(ctx2, 0, encoder, 5)
+    # def precomputed_zeros(ctx: TContext, id: int, encoder: Callable, num: int) -> Tensor:
+    cdev = ctx._g.compute_device()
+    if ctx._training or not ctx._time_enabled:
+        # return encoder(True, None)
+        return encoder(True, torch.zeros(num, dtype=torch.float, device=cdev))
+        
+        if ctx._z is not None:
+            return encoder.preload_zeros(ctx._z.expand(num))
+        else: 
+            # 写kernel 不要真的生成torch.zeros
+            if getattr(encoder, '__tg_builtin_encoder__', False):
+                return encoder.zeros(num, cdev)
+            else:
+                return encoder(False, torch.zeros(num, dtype=torch.float, device=cdev))
 
-    adj_csr = sp.csr_matrix((numlist.numpy(), (row, col)), shape=(g.num_nodes(), g.num_nodes()))
+    time_table = ctx._time_tables.get(id) # id 为layer id
+    if time_table is None:
+        time_table = encoder(False, torch.arange(
+            ctx._time_window + 1, dtype=torch.float, device=cdev))
+        ctx._time_tables[id] = time_table
+
+    output = time_table[0].repeat(num, 1)
+    result2 = output.view(num, -1)
+    print("推理模式结果形状:", result2.shape)
+
+def test_precomputed_times():
+    # 测试场景1: 训练模式
+    ctx = MockTContext(training=True)
+    def encoder(is_zero, times):
+        if is_zero:
+            return torch.zeros(len(times), 10, device=ctx._g.compute_device())
+        else:
+            return torch.randn(len(times), 10, device=ctx._g.compute_device())
+    times = torch.tensor([1.0, 2.0, 3.0], device=ctx._g.compute_device())
+    id = 0
+    # result1 = precomputed_times(ctx1, 0, encoder, times)
+    # def precomputed_times(ctx: TContext, id: int, encoder: Callable, times: Tensor) -> Tensor:
+    with nvtx.annotate("precompute_times", color="red"):
+        if ctx._training or not ctx._time_enabled:
+            return encoder(False, times)
     
-    row_ptr=torch.from_numpy(adj_csr.indptr)
-    col_ind=torch.from_numpy(adj_csr.indices)
+        time_table = ctx._time_tables.get(id)
+        if time_table is None:
+            time_table = encoder(torch.arange(
+                ctx._time_window + 1, dtype=torch.float, device=ctx._g.compute_device()))
+            ctx._time_tables[id] = time_table
 
-    adj_csc=adj_csr.tocsc()
+        size = times.shape[0]
+        hit_count, hit_idx, output, times, inv_idx = \
+            _c.find_dedup_time_hits(times, time_table, ctx._time_window)
+        uniq_size = times.shape[0]
 
-    col_ptr=torch.from_numpy(adj_csc.indptr)
-    row_ind=torch.from_numpy(adj_csc.indices)
+        if hit_count != uniq_size:
+            # memory_stats(inspect.getfile(inspect.currentframe()), inspect.currentframe().f_lineno)
+            miss_idx = (~ hit_idx)
+            times = times[miss_idx]
+            output[miss_idx] = encoder(times.squeeze())
 
-    adj_csr_new=sp.csr_matrix((numlist.numpy(),col_ind.cpu().numpy(),row_ptr.cpu().numpy()))
-    adj_csc_new=adj_csr_new.tocsc()
-    permute=torch.from_numpy(adj_csc_new.data)
-    print(permute)
-    features=g.ndata['feat']
-    labels=g.ndata['label']
-    n_feats=features.shape[1]
-    n_classes=data.num_labels
-    train_mask = g.ndata['train_mask']
-    test_mask = g.ndata['test_mask']
+        output = output[inv_idx]
+        result1 = output.view(size, -1)
+    print("训练模式结果形状:", result1.shape)
+    
+    # 测试场景2: 推理模式
+    ctx = MockTContext(training=False)
+    # result2 = precomputed_times(ctx2, 0, encoder, times)
+    # def precomputed_times(ctx: TContext, id: int, encoder: Callable, times: Tensor) -> Tensor:
+    with nvtx.annotate("precompute_times", color="red"):
+        if ctx._training or not ctx._time_enabled:
+            return encoder(False, times)
+    
+        time_table = ctx._time_tables.get(id)
+        if time_table is None:
+            time_table = encoder(torch.arange(
+                ctx._time_window + 1, dtype=torch.float, device=ctx._g.compute_device()))
+            ctx._time_tables[id] = time_table
 
-    return row_ptr,col_ind,col_ptr,row_ind,edge_idx,features,labels,n_feats,n_classes,train_mask,test_mask,permute
+        size = times.shape[0]
+        hit_count, hit_idx, output, times, inv_idx = \
+            _c.find_dedup_time_hits(times, time_table, ctx._time_window)
+        uniq_size = times.shape[0]
 
-def main(args):
-    #load dataset
-    row_ptr,col_idx,col_ptr,row_idx,edge_idx,features,labels,n_feats,n_classes,train_mask,test_mask,permute=load_dataset(args)
+        if hit_count != uniq_size:
+            # memory_stats(inspect.getfile(inspect.currentframe()), inspect.currentframe().f_lineno)
+            miss_idx = (~ hit_idx)
+            times = times[miss_idx]
+            output[miss_idx] = encoder(times.squeeze())
 
-    row_ptr=row_ptr.to(args.gpu).int()
-    col_idx=col_idx.to(args.gpu).int()
-    col_ptr=col_ptr.to(args.gpu).int()
-    row_idx=row_idx.to(args.gpu).int()
-    features=features.to(args.gpu)
-    labels=labels.to(args.gpu)
-    train_mask=train_mask.to(args.gpu)
-    test_mask=train_mask.to(args.gpu)
-    permute=permute.to(args.gpu)
+        output = output[inv_idx]
+        result2 = output.view(size, -1)
+    print("推理模式结果形状:", result2.shape)
 
-    heads = ([args.n_heads] * args.n_layers) + [1]
-    model=Net(row_ptr,col_idx,col_ptr,row_idx,permute,args.n_layers,n_feats,args.n_hidden,n_classes,heads,attn_drop=args.attn_drop,feat_drop=args.dropout,negative_slope=args.negative_slope).to(args.gpu)
-    loss_fcn = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+class PerformanceMetrics:
+    def __init__(self):
+        self.train_times: List[float] = []
+        self.inference_times: List[float] = []
+        self.memory_usage: List[float] = []
+        
+    def add_metrics(self, train_time: float, inference_time: float, memory_usage: float):
+        self.train_times.append(train_time)
+        self.inference_times.append(inference_time)
+        self.memory_usage.append(memory_usage)
+        
+    def get_average_metrics(self) -> Tuple[float, float, float]:
+        return (
+            np.mean(self.train_times),
+            np.mean(self.inference_times),
+            np.mean(self.memory_usage)
+        )
 
-    print(args)
-    print('warm up')
-    maxMemory = 0
-    for _ in range(10):
-        model.train()
-        logits = model(features)
-        loss = loss_fcn(logits[train_mask], labels[train_mask])
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()  
-        GPUs = GPUtil.getGPUs()
-        maxMemory = max(GPUs[args.gpu].memoryUsed, maxMemory) 
-  
-    # print('profile training')
-    # model.train()
-    # torch.cuda.synchronize()
-    # start=time.time()
-    # for _ in range(args.n_epochs):
-    #     logits=model(features)
-    #     loss=loss_fcn(logits[train_mask],labels[train_mask])
-    #     optimizer.zero_grad()
-    #     loss.backward()
-    #     optimizer.step()   
-    #     print(loss.item())
-    # torch.cuda.synchronize()
-    # end=time.time()
-    # train_time=(end-start)/args.n_epochs
+def generate_test_data(
+    index: torch.Tensor,
+    num_nodes: int,
+    num_dsts: int,
+    num_edges: int, # num_srcs
+    dim_node: int,
+    dim_edge: int,
+    dim_time: int,
+    device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """生成测试数据"""
+    # 创建测试数据
+    blk = MockBlock(
+        index=index,
+        num_src=num_edges,  # 源节点数
+        num_dst=num_dsts,  # 目标节点数
+        num_edges=num_edges,  # 边数
+        device=device
+    )
+    
+    # 创建Context
+    ctx = MockTContext(device=device)
+    
+    return {
+        'blk': blk,
+        'ctx': ctx,
+        'node_features': torch.randn(num_nodes, dim_node, device=device),
+        'edge_features': torch.randn(num_edges, dim_edge, device=device),
+        'time_features': torch.randn(num_edges, dim_time, device=device),
+        'node_inverse': torch.randint(0, num_nodes, (num_edges,), device=device),
+        'edge_inverse': torch.arange(num_edges, device=device),
+        'time_inverse': torch.arange(num_edges, device=device),
+    }
 
-    print('profile inference')
-    model.eval()
-    torch.cuda.synchronize()
-    start=time.time()
-    for epoch in range(args.n_epochs):  
+def measure_memory_usage() -> float:
+    """测量当前GPU内存使用情况"""
+    if torch.cuda.is_available():
+        # 同步所有CUDA流
+        torch.cuda.synchronize()
+        # 获取当前内存使用
+        current_memory = torch.cuda.memory_allocated() / 1024**2  # 转换为MB
+        # 获取峰值内存使用
+        peak_memory = torch.cuda.max_memory_allocated() / 1024**2  # 转换为MB
+        return max(current_memory, peak_memory)
+    return 0.0
+
+def test_layer_performance(
+    layer: torch.nn.Module,
+    test_data: Dict[str, torch.Tensor],
+    num_epochs: int = 10,
+    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+) -> Tuple[float, float, float]:
+    """测试单个层的性能"""
+    # 重置峰值内存统计
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+    
+    layer = layer.to(device)
+    optimizer = torch.optim.Adam(layer.parameters())
+    criterion = torch.nn.MSELoss()
+    
+    # 预热
+    for _ in range(5):
         with torch.no_grad():
-            logits=model(features)
-    torch.cuda.synchronize()
-    end=time.time()
-    inference_time=(end-start)/args.n_epochs
+            _ = layer(test_data['blk'])
     
-    logits = logits[test_mask]  
-    acc=accuracy(logits, labels[test_mask])
-    print("Test Accuracy {:.4f}".format(acc))
-    print(f'max memory:{maxMemory}MB')
-    # print("train time:",train_time)
-    print("inference time:",inference_time)
+    # 测量训练时间
+    train_start = time.time()
+    for _ in range(num_epochs):
+        optimizer.zero_grad()
+        output = layer(test_data['blk'])
+        loss = criterion(output, torch.randn_like(output))
+        loss.backward()
+        optimizer.step()
+    train_time = time.time() - train_start
+    
+    # 测量推理时间
+    inference_start = time.time()
+    with torch.no_grad():
+        for _ in range(num_epochs):
+            _ = layer(test_data['blk'])
+    inference_time = time.time() - inference_start
+    
+    # 测量内存使用
+    memory_usage = measure_memory_usage()
+    
+    # 清理GPU内存
+    torch.cuda.empty_cache()
+    
+    return train_time, inference_time, memory_usage
 
-    if args.output!=None:
-        with open("{}".format(args.output),'a') as f:
-            print("train_GAT_dgnn,{} heads={} hidden_dim={},{:f}s,{:f}s,{}MB,{}".format(args.dataset,args.n_heads,args.n_hidden,train_time,inference_time,maxMemory,acc),file=f)
+def run_ablation_study(
+    test_data: Dict[str, torch.Tensor],
+    num_epochs: int = 10,
+    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+) -> Dict[str, PerformanceMetrics]:
+    """运行消融实验"""
+    
+    # 每次测试前清理GPU内存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # 创建所有层
+    layers = {
+        # 'original': OriginalLayer(dim_in=64, dim_out=64, num_heads=4),
+        # 'optimized': OptimizedLayer(dim_in=64, dim_out=64, num_heads=4),
+        # 'ablation1': Ablation1Layer(dim_in=64, dim_out=64, num_heads=4),
+        # 'ablation2': Ablation2Layer(dim_in=64, dim_out=64, num_heads=4),
+        'warmup': OriginalLayer(
+            ctx=test_data['ctx'],
+            dim_node=100,
+            dim_edge=172,
+            dim_time=100,
+            dim_out=100,
+            num_heads=2,
+            dropout=0.1
+        ),
+        'original': OriginalLayer(
+            ctx=test_data['ctx'],
+            dim_node=100,
+            dim_edge=172,
+            dim_time=100,
+            dim_out=100,
+            num_heads=2,
+            dropout=0.1
+        ),
+        'optimized': OriginalLayer(
+            ctx=test_data['ctx'],
+            dim_node=100,
+            dim_edge=172,
+            dim_time=100,
+            dim_out=100,
+            num_heads=2,
+            dropout=0.1
+        ),
+        'ablation1': OriginalLayer(
+            ctx=test_data['ctx'],
+            dim_node=100,
+            dim_edge=172,
+            dim_time=100,
+            dim_out=100,
+            num_heads=2,
+            dropout=0.1
+        ),
+        'ablation2': OriginalLayer(
+            ctx=test_data['ctx'],
+            dim_node=100,
+            dim_edge=172,
+            dim_time=100,
+            dim_out=100,
+            num_heads=2,
+            dropout=0.1
+        ),
+    }
+    
+    results = {}
+    for name, layer in layers.items():
+        print(f"\n测试 {name} 版本...")
+        metrics = PerformanceMetrics()
+        
+        # 运行多次测试以获得平均值
+        for i in range(5):
+            print(f"运行第 {i+1} 次测试...")
+            # 每次测试前清理GPU内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            train_time, inference_time, memory_usage = test_layer_performance(
+                layer, test_data, num_epochs, device
+            )
+            metrics.add_metrics(train_time, inference_time, memory_usage)
+            
+            # 删除层以释放内存
+            del layer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 重新创建层
+            layer = layers[name]
+        
+        results[name] = metrics
+    
+    return results
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='GAT')
-    parser.add_argument("--dataset",type=str,default="cora")
-    parser.add_argument("--gpu", type=int, default=0,
-                        help="which GPU to use. Set -1 to use CPU.")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="learning rate")
-    parser.add_argument("--weight-decay", type=float, default=5e-4,
-                        help="Weight for L2 loss")
-    parser.add_argument("--dropout", type=float, default=0.5,
-                        help="dropout probability")
-    parser.add_argument("--n-epochs", type=int, default=200,
-                        help="number of training epochs")
-    parser.add_argument("--n-hidden", type=int, default=16,
-                        help="number of hidden gcn units")
-    parser.add_argument("--n-layers", type=int, default=1,
-                        help="number of hidden gcn layers")
-    parser.add_argument("--n-heads", type=int, default=1,
-                        help="number of hidden attention heads")
-    parser.add_argument('--negative-slope', type=float, default=0.2,
-                        help="the negative slope of leaky relu")
-    parser.add_argument('--attn-drop',type=float,default=0.,
-                        help="drop out rate for attention weights")
-    parser.add_argument('--output',type=str,default=None,
-                        help="output file")
-                    
-    args = parser.parse_args()
-    print(args)
-    main(args)
+def print_results(results: Dict[str, PerformanceMetrics]):
+    """打印实验结果"""
+    print("\n=== 性能对比结果 ===")
+    print("版本\t\t训练时间(s)\t推理时间(s)\t内存使用(MB)\t加速比")
+    print("-" * 70)
+    
+    # 使用原始版本作为基准
+    base_metrics = results['original'].get_average_metrics()
+    
+    for name, metrics in results.items():
+        if name != 'warmup':
+            train_time, inference_time, memory_usage = metrics.get_average_metrics()
+            train_speedup = base_metrics[0] / train_time
+            inference_speedup = base_metrics[1] / inference_time
+            
+            print(f"{name:<12} {train_time:>10.4f} {inference_time:>10.4f} "
+                f"{memory_usage:>10.2f} {train_speedup:>10.2f}x")
+
+def main():
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    # 生成测试数据
+    print("\n生成测试数据...")
+    test_data = generate_test_data(
+        index=torch.load("blk._g_dstindex.pt"),
+        num_nodes=90180,
+        num_dsts=16350,
+        num_edges=90180,
+        dim_node=100,
+        dim_edge=172,
+        dim_time=100,
+        device=device
+    )
+    
+    # 运行消融实验
+    print("\n开始性能测试...")
+    results = run_ablation_study(test_data, num_epochs=10, device=device)
+    
+    # 打印结果
+    print_results(results)
+
+        
+    # # 测试 precomputed_zeros
+    # print("\n测试 precomputed_zeros:")
+    # test_precomputed_zeros()
+    # print("\n测试 precomputed_times:")
+    # test_precomputed_times()
+
+
+if __name__ == "__main__":
+    main()
 
