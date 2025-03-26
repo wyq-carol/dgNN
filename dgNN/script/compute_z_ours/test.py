@@ -13,7 +13,7 @@ from tglite.mymodule import *
 import torch
 import time
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Callable
 import sys
 import os
 from tglite.nn import TemporalAttnLayer as OriginalLayer
@@ -21,7 +21,9 @@ from tglite._context import TContext
 from tglite._sampler import TSampler
 from tglite.op import precomputed_zeros, precomputed_times
 from tglite import _c
-
+from dgNN.layers import TemporalAttnLayer0_2_perfCeil as OptimizedLayer
+from torch import Tensor
+from tglite._block import TBlock
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -115,7 +117,7 @@ def test_precomputed_zeros():
             # 写kernel 不要真的生成torch.zeros
             if getattr(encoder, '__tg_builtin_encoder__', False):
                 return encoder.zeros(num, cdev)
-            else:
+    else:
                 return encoder(False, torch.zeros(num, dtype=torch.float, device=cdev))
 
     time_table = ctx._time_tables.get(id) # id 为layer id
@@ -286,62 +288,69 @@ def measure_memory_usage() -> float:
         return max(current_memory, peak_memory)
     return 0.0
 
-def test_layer_performance(
-    layer: torch.nn.Module,
-    test_data: Dict[str, torch.Tensor],
-    num_epochs: int = 10,
-    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-) -> Tuple[float, float, float]:
+def get_layer_input(layer, test_data):
+    """根据层类型返回对应的输入参数"""
+    if isinstance(layer, (OriginalLayer, OptimizedLayer)):
+        return (test_data['blk'],)  # 返回一个单元素元组
+    else:  # GATConv
+        return (test_data['row_ptr'], test_data['col_idx'], test_data['col_ptr'], 
+                test_data['row_idx'], test_data['permute'], test_data['features'])
+
+def test_layer_performance(layer, test_data, num_epochs=10, device='cuda'):
     """测试单个层的性能"""
-    # 重置峰值内存统计
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.empty_cache()
+    # 重置GPU内存统计
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
     
+    # 将层移动到指定设备
     layer = layer.to(device)
-    optimizer = torch.optim.Adam(layer.parameters())
-    criterion = torch.nn.MSELoss()
+    
+    # 准备优化器和损失函数
+    optimizer = torch.optim.Adam(layer.parameters(), lr=0.01)
+    criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+    
+    # 获取输入参数
+    input_args = get_layer_input(layer, test_data)
     
     # 预热
     for _ in range(5):
-        with torch.no_grad():
-            _ = layer(test_data['blk'])
+        _ = layer(*input_args)
     
-    # 测量训练时间
-    train_start = time.time()
+    # 测试训练时间
+    layer.train()
+    torch.cuda.synchronize()
+    start_time = time.time()
+    
     for _ in range(num_epochs):
         optimizer.zero_grad()
-        output = layer(test_data['blk'])
+        output = layer(*input_args)
         loss = criterion(output, torch.randn_like(output))
         loss.backward()
         optimizer.step()
-    train_time = time.time() - train_start
     
-    # 测量推理时间
-    inference_start = time.time()
+    torch.cuda.synchronize()
+    train_time = (time.time() - start_time) / num_epochs
+    
+    # 测试推理时间
+    layer.eval()
+    torch.cuda.synchronize()
+    start_time = time.time()
+    
     with torch.no_grad():
         for _ in range(num_epochs):
-            _ = layer(test_data['blk'])
-    inference_time = time.time() - inference_start
+            _ = layer(*input_args)
+    
+    torch.cuda.synchronize()
+    inference_time = (time.time() - start_time) / num_epochs
     
     # 测量内存使用
     memory_usage = measure_memory_usage()
     
-    # 清理GPU内存
-    torch.cuda.empty_cache()
-    
     return train_time, inference_time, memory_usage
 
-def run_ablation_study(
-    test_data: Dict[str, torch.Tensor],
-    num_epochs: int = 10,
-    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-) -> Dict[str, PerformanceMetrics]:
+def run_ablation_study(test_data, num_epochs=10, device='cuda'):
     """运行消融实验"""
-    
-    # 每次测试前清理GPU内存
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    results = {}
     
     # 创建所有层
     layers = {
@@ -396,52 +405,43 @@ def run_ablation_study(
         ),
     }
     
-    results = {}
+    # 测试每个层
     for name, layer in layers.items():
-        print(f"\n测试 {name} 版本...")
-        metrics = PerformanceMetrics()
+        print(f"\n测试 {name} 层...")
+        train_time, inference_time, memory_usage = test_layer_performance(
+            layer, test_data, num_epochs, device
+        )
+        results[name] = {
+            'train_time': train_time,
+            'inference_time': inference_time,
+            'memory_usage': memory_usage
+        }
         
-        # 运行多次测试以获得平均值
-        for i in range(5):
-            print(f"运行第 {i+1} 次测试...")
-            # 每次测试前清理GPU内存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            train_time, inference_time, memory_usage = test_layer_performance(
-                layer, test_data, num_epochs, device
-            )
-            metrics.add_metrics(train_time, inference_time, memory_usage)
-            
-            # 删除层以释放内存
-            del layer
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # 重新创建层
-            layer = layers[name]
-        
-        results[name] = metrics
+        # 清理GPU内存
+        del layer
+        torch.cuda.empty_cache()
     
     return results
 
-def print_results(results: Dict[str, PerformanceMetrics]):
+def print_results(results: Dict[str, Dict[str, float]]):
     """打印实验结果"""
     print("\n=== 性能对比结果 ===")
-    print("版本\t\t训练时间(s)\t推理时间(s)\t内存使用(MB)\t加速比")
+    print("版本\t\t训练时间(s)\t推理时间(s)\t内存使用(MB)\t训练加速比\t推理加速比")
     print("-" * 70)
     
     # 使用原始版本作为基准
-    base_metrics = results['original'].get_average_metrics()
+    base_metrics = results['original']
     
     for name, metrics in results.items():
         if name != 'warmup':
-            train_time, inference_time, memory_usage = metrics.get_average_metrics()
-            train_speedup = base_metrics[0] / train_time
-            inference_speedup = base_metrics[1] / inference_time
+            train_time = metrics['train_time']
+            inference_time = metrics['inference_time']
+            memory_usage = metrics['memory_usage']
+            train_speedup = base_metrics['train_time'] / train_time
+            inference_speedup = base_metrics['inference_time'] / inference_time
             
             print(f"{name:<12} {train_time:>10.4f} {inference_time:>10.4f} "
-                f"{memory_usage:>10.2f} {train_speedup:>10.2f}x")
+                f"{memory_usage:>10.2f} {train_speedup:>10.2f}x {inference_speedup:>10.2f}x")
 
 def main():
     # 设置随机种子
